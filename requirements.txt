@@ -1,0 +1,9 @@
+streamlit
+boto3
+botocore
+python-dotenv
+SpeechRecognition 
+pyttsx3 
+PyAudio
+pytesseract 
+pillow
