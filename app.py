@@ -1,58 +1,93 @@
-import streamlit as st
-import boto3
-import os
+from __future__ import annotations
 import json
+import logging
+import os
 import time
 import traceback
-import logging
-from dotenv import load_dotenv
-import speech_recognition as sr
-import pyttsx3
 from datetime import datetime
-from PIL import Image
-import pytesseract
+from typing import List, Dict, Any, Optional
 
-# Logging setup
-logging.basicConfig(level=logging.INFO)
+import boto3
+import botocore.exceptions as boto_exc
+import pyttsx3
+import pytesseract
+import speech_recognition as sr
+import streamlit as st
+from dotenv import load_dotenv
+from PIL import Image
+
+# ─────────────────────── 1. Logging & ENV ────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger("AskRockAI")
 
 load_dotenv()
 
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-MODEL_ID = os.getenv("BEDROCK_INFERENCE_PROFILE_ARN")
+AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+MODEL_ID: str = os.getenv("BEDROCK_INFERENCE_PROFILE_ARN", "")
 DEFAULT_MAX_RETRIES = 7
 DEFAULT_RETRY_DELAY_SECONDS = 3
-DEFAULT_MAX_TOKENS = 25000
+DEFAULT_MAX_TOKENS = 25_000
 
-# Assume IAM Role for credentials
 ROLE_ARN = "arn:aws:iam::207567766326:role/Workmates-SSO-L2SupportRole"
 SESSION_NAME = "AskRockAISession"
 
-try:
-    logger.info(f"Assuming IAM Role: {ROLE_ARN} ...")
-    base_session = boto3.Session()
-    sts_client = base_session.client("sts", region_name=AWS_REGION)
-    assumed_role = sts_client.assume_role(
-        RoleArn=ROLE_ARN,
-        RoleSessionName=SESSION_NAME,
-        DurationSeconds=3600,
-    )
+# ───────────────────── 2. AWS client bootstrap ───────────────────
 
-    credentials = assumed_role['Credentials']
+def get_bedrock_client() -> boto3.client:  # type: ignore[return-value]
+    """Return a Bedrock Runtime client after assuming **ROLE_ARN**.
 
-    bedrock_runtime = boto3.client(
-        "bedrock-runtime",
-        region_name=AWS_REGION,
-        aws_access_key_id=credentials["AccessKeyId"],
-        aws_secret_access_key=credentials["SecretAccessKey"],
-        aws_session_token=credentials["SessionToken"],
-    )
+    Raises
+    ------
+    streamlit.StopException
+        If *no* base credentials are found, a friendly Streamlit error is shown
+        and the script stops.
+    """
+    try:
+        # 2a. ensure some creds exist (env / profile / instance‑role)
+        base_session = boto3.Session(region_name=AWS_REGION)
+        if base_session.get_credentials() is None:
+            raise boto_exc.NoCredentialsError()
 
-    logger.info("Successfully assumed role and created bedrock_runtime client.")
+        # 2b. assume the target role
+        sts = base_session.client("sts")
+        logger.info("Assuming role %s …", ROLE_ARN)
+        assumed = sts.assume_role(
+            RoleArn=ROLE_ARN,
+            RoleSessionName=SESSION_NAME,
+            DurationSeconds=3600,
+        )["Credentials"]
 
-except Exception as e:
-    logger.error(f"Failed to assume role: {e}")
-    raise
+        # 2c. create bedrock‑runtime client with assumed creds
+        return boto3.client(
+            "bedrock-runtime",
+            region_name=AWS_REGION,
+            aws_access_key_id=assumed["AccessKeyId"],
+            aws_secret_access_key=assumed["SecretAccessKey"],
+            aws_session_token=assumed["SessionToken"],
+        )
+
+    except boto_exc.NoCredentialsError:
+        msg = (
+            "🛑  No AWS credentials were found.\n\n"
+            "Provide *any* base credentials via:\n"
+            " • Environment vars AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY\n"
+            " • An AWS profile (set AWS_PROFILE after `aws configure` or `aws sso login`)\n"
+            " • An instance/Lambda/ECS role."
+        )
+        logger.error(msg)
+        st.error(msg)
+        st.stop()
+
+    except Exception as exc:
+        logger.exception("Failed to assume role or create Bedrock client")
+        st.error(f"Unexpected AWS error: {exc}")
+        st.stop()
+
+# create once; Streamlit caches between reruns
+bedrock_runtime = get_bedrock_client()
+logger.info("Bedrock client initialised ✔")
+
+# ─────────────────────── 3. Helper functions ─────────────────────
 
 def microphone_available() -> bool:
     try:
@@ -62,12 +97,58 @@ def microphone_available() -> bool:
         logger.warning("Microphone check failed: %s", e)
         return False
 
-# Streamlit page setup
+def build_prompt(question: str, topic: str, ocr_text: str) -> str:
+    prompt = f"Topic: {topic}\n\nQuestion: {question}"
+    if ocr_text.strip():
+        prompt += f"\n\nAdditional context extracted from image:\n{ocr_text.strip()}"
+    return prompt
+
+def format_output(text: str) -> str:
+    return text.strip()
+
+def speak_text(text: str) -> None:
+    engine = pyttsx3.init()
+    engine.setProperty("rate", 180)
+    engine.say(text)
+    engine.runAndWait()
+
+def attempt_model_invoke(payload: Dict[str, Any], retries: int, delay: int) -> Optional[str]:
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            logger.info("Attempt %d: sending request to Bedrock …", attempt)
+            start = time.time()
+            response = bedrock_runtime.invoke_model(
+                modelId=MODEL_ID,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(payload).encode("utf-8"),
+            )
+            logger.info("Response in %.2fs", time.time() - start)
+            raw = response["body"].read().decode("utf-8")
+            logger.debug("Raw response: %s", raw)
+            data = json.loads(raw)
+            messages = data.get("content", [])
+            if isinstance(messages, list) and messages:
+                return messages[0].get("text", "").strip()
+            logger.warning("Unexpected response structure: %s", data)
+            return None
+        except Exception as exc:
+            logger.error("Attempt %d failed: %s", attempt, exc)
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(delay)
+    if last_exc:
+        raise last_exc
+    return None
+
+# ───────────────────────── 4. UI – Streamlit ─────────────────────
+
 st.set_page_config(page_title="🪨🎙️ AskRock AI with Chat", page_icon="🪨", layout="wide")
 st.title("🪨🎙️ AskRock AI: Bedrock Chat Assistant")
 st.caption("_Now with Chat History, Save, and Optional Image OCR!_")
 
-# Sidebar
+# Sidebar settings
 with st.sidebar:
     st.header("⚙️ Settings")
     max_tokens = st.slider("Max tokens:", 500, 30000, DEFAULT_MAX_TOKENS, step=500)
@@ -88,10 +169,12 @@ if theme == "Dark":
     )
 
 topic = st.text_input("🔎 Optional topic (e.g., Finance, Science):", value="General")
+
 col1, col2 = st.columns(2)
+
 with col1:
     st.subheader("💬 Type your question")
-    user_query = st.text_area(" ", placeholder="Enter your question here...")
+    user_query = st.text_area(" ", placeholder="Enter your question here…")
 
     st.subheader("🖼️ Optionally upload an image with your question")
     uploaded_image = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"])
@@ -105,8 +188,8 @@ with col1:
                 st.info(f"📝 Extracted text from image:\n\n{extracted_text.strip()}")
             else:
                 st.warning("⚠️ No text could be extracted from the image.")
-        except Exception as e:
-            st.error(f"Failed to parse image: {e}")
+        except Exception as exc:
+            st.error(f"Failed to parse image: {exc}")
 
 with col2:
     st.subheader("🎤 Record your question")
@@ -116,7 +199,7 @@ with col2:
                 recognizer = sr.Recognizer()
                 mic = sr.Microphone()
                 with mic as source:
-                    st.info("Listening... speak clearly.")
+                    st.info("Listening… speak clearly.")
                     audio = recognizer.listen(source, timeout=10, phrase_time_limit=20)
                 try:
                     text = recognizer.recognize_google(audio)
@@ -124,63 +207,18 @@ with col2:
                     st.success(f"📝 Transcribed: {text}")
                 except sr.UnknownValueError:
                     st.error("Could not understand audio. Please try again.")
-                except sr.RequestError as e:
-                    st.error(f"Speech recognition error: {e}")
-            except OSError as e:
+                except sr.RequestError as exc:
+                    st.error(f"Speech recognition error: {exc}")
+            except OSError as exc:
                 st.error("🎤 No microphone detected on this device/environment. Please use text input instead.")
-                logger.error("Microphone initialization error: %s", str(e))
+                logger.error("Microphone init error: %s", exc)
     else:
         st.info("🎤 Microphone not available in this environment. Please use text input or upload an image.")
 
-def build_prompt(question: str, topic: str, ocr_text: str) -> str:
-    prompt = f"Topic: {topic}\n\nQuestion: {question}"
-    if ocr_text.strip():
-        prompt += f"\n\nAdditional context extracted from image:\n{ocr_text.strip()}"
-    return prompt
+# ─────────────────── 5. Chat handling & history ──────────────────
 
-def format_output(text: str) -> str:
-    return text.strip()
-
-def speak_text(text: str):
-    engine = pyttsx3.init()
-    engine.setProperty("rate", 180)
-    engine.say(text)
-    engine.runAndWait()
-
-def attempt_model_invoke(payload: dict, retries: int, delay: int) -> str:
-    last_exception = None
-    for attempt in range(1, retries + 1):
-        try:
-            logger.info("Attempt %d: Sending request to Bedrock...", attempt)
-            start_time = time.time()
-            response = bedrock_runtime.invoke_model(
-                modelId=MODEL_ID,
-                contentType="application/json",
-                accept="application/json",
-                body=json.dumps(payload).encode("utf-8"),
-            )
-            elapsed = time.time() - start_time
-            logger.info("Response received in %.2fs.", elapsed)
-            raw_response = response["body"].read().decode("utf-8")
-            logger.debug("Raw response: %s", raw_response)
-            result = json.loads(raw_response)
-            messages = result.get("content", [])
-            if messages and isinstance(messages, list):
-                return messages[0].get("text", "").strip()
-            else:
-                logger.warning("Unexpected response structure: %s", result)
-                return None
-        except Exception as e:
-            logger.error("Attempt %d failed: %s", attempt, str(e))
-            last_exception = e
-            if attempt < retries:
-                time.sleep(delay)
-    if last_exception:
-        raise last_exception
-
-# Initialize chat history in session state
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+    st.session_state.chat_history: List[Dict[str, str]] = []  # type: ignore[assignment]
 
 if st.button("🚀 Get Answer"):
     if not user_query.strip() and not extracted_text.strip():
@@ -194,24 +232,26 @@ if st.button("🚀 Get Answer"):
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": combined_prompt}],
         }
-
         try:
-            with st.spinner("Thinking... ⏳"):
+            with st.spinner("Thinking… ⏳"):
                 answer = attempt_model_invoke(payload, max_retries, retry_delay)
             if answer:
-                formatted_answer = format_output(answer)
+                formatted = format_output(answer)
                 st.success("✅ **Answer:**")
-                st.markdown(f"### {formatted_answer}")
-                st.session_state.chat_history.append(
-                    {"question": user_query or '[Image-only question]', "answer": formatted_answer}
-                )
+                st.markdown(f"### {formatted}")
+                st.session_state.chat_history.append({
+                    "question": user_query or "[Image-only question]",
+                    "answer": formatted,
+                })
                 if auto_speak:
-                    speak_text(formatted_answer)
+                    speak_text(formatted)
             else:
                 st.error("⚠️ No response received after retries.")
-        except Exception as e:
-            st.error(f"❌ Error: {str(e)}")
+        except Exception as exc:
+            st.error(f"❌ Error: {exc}")
             st.text(traceback.format_exc())
+
+# ───────────────────── 6. Display chat history ───────────────────
 
 if st.session_state.chat_history:
     st.markdown("---")
@@ -222,9 +262,7 @@ if st.session_state.chat_history:
 
     if st.download_button(
         label="💾 Download Chat History",
-        data="\n\n".join(
-            f"Q: {e['question']}\nA: {e['answer']}" for e in st.session_state.chat_history
-        ),
+        data="\n\n".join(f"Q: {e['question']}\nA: {e['answer']}" for e in st.session_state.chat_history),
         file_name=f"askrock_chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
         mime="text/plain",
     ):
