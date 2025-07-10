@@ -4,10 +4,12 @@ import json
 import logging
 import os
 import time
+import traceback
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 import boto3
+import botocore.exceptions as boto_exc
 import pyttsx3
 import pytesseract
 import speech_recognition as sr
@@ -21,62 +23,43 @@ logger = logging.getLogger("AskRockAI")
 
 load_dotenv()
 
+# Configuration
 AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
 MODEL_ID: str = os.getenv("BEDROCK_INFERENCE_PROFILE_ARN", "")
 DEFAULT_MAX_RETRIES = 7
 DEFAULT_RETRY_DELAY_SECONDS = 3
-DEFAULT_MAX_TOKENS = 25_000
+DEFAULT_MAX_TOKENS = 25000
 
 ROLE_ARN = "arn:aws:iam::207567766326:role/Workmates-SSO-L2SupportRole"
 SESSION_NAME = "AskRockAISession"
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
 # ───────────────────── 2. AWS client bootstrap ───────────────────
 
-def _session_from_streamlit_secrets() -> Optional[boto3.Session]:
-    """Return a boto3.Session built from `st.secrets['aws']` if present."""
-    secret_block = st.secrets.get("aws", None)
-    if not secret_block:
-        return None
-    key = secret_block.get("access_key_id")
-    sec = secret_block.get("secret_access_key")
-    tok = secret_block.get("session_token")  # optional
-    if key and sec:
-        logger.info("🔑 Using AWS credentials from st.secrets")
-        return boto3.Session(
-            aws_access_key_id=key,
-            aws_secret_access_key=sec,
-            aws_session_token=tok,
-            region_name=AWS_REGION,
-        )
-    return None
-
 def get_bedrock_client() -> boto3.client:  # type: ignore[return-value]
-    """Return a Bedrock Runtime client after assuming ROLE_ARN."""
-    boto_session = _session_from_streamlit_secrets() or boto3.Session(region_name=AWS_REGION)
+    """
+    Return a Bedrock Runtime client after assuming **ROLE_ARN**.
 
-    if boto_session.get_credentials() is None:
-        msg = (
-            "🛑  No AWS credentials were found.\n\n"
-            "Add them either:\n"
-            " • In Streamlit Cloud as secrets: `aws.access_key_id`, `aws.secret_access_key`\n"
-            " • Environment vars AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY\n"
-            " • An AWS profile (AWS_PROFILE) or instance role."
-        )
-        logger.error(msg)
-        st.error(msg)
-        st.stop()
-
+    Raises
+    ------
+    streamlit.StopException
+        If no base credentials are found, a Streamlit error is shown
+        and the script is stopped.
+    """
     try:
-        sts = boto_session.client("sts")
-        caller = sts.get_caller_identity()["Arn"]
-        logger.info("🔐 Base identity: %s", caller)
+        # Assume the target IAM role using default boto3 credentials
+        sts = boto3.client("sts", region_name=AWS_REGION)
         logger.info("Assuming role %s …", ROLE_ARN)
+
         assumed = sts.assume_role(
             RoleArn=ROLE_ARN,
             RoleSessionName=SESSION_NAME,
             DurationSeconds=3600,
         )["Credentials"]
 
+        # Return a bedrock-runtime client using the assumed temporary credentials
         return boto3.client(
             "bedrock-runtime",
             region_name=AWS_REGION,
@@ -85,11 +68,30 @@ def get_bedrock_client() -> boto3.client:  # type: ignore[return-value]
             aws_session_token=assumed["SessionToken"],
         )
 
+    except boto_exc.NoCredentialsError:
+        msg = (
+            "🛑  No AWS credentials were found.\n\n"
+            "Provide *any* base credentials via:\n"
+            " • Environment vars AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY\n"
+            " • An AWS profile (set AWS_PROFILE after `aws configure` or `aws sso login`)\n"
+            " • An instance/Lambda/ECS role."
+        )
+        logger.error(msg)
+        st.error(msg)
+        st.stop()
+
+    except boto_exc.ClientError as exc:
+        logger.error("❌ Failed to assume role: %s", exc)
+        st.error(f"Unable to assume IAM role:\n{exc}")
+        st.stop()
+
     except Exception as exc:
-        logger.exception("Failed to assume role or create Bedrock client")
+        logger.exception("Unexpected error while creating Bedrock client")
         st.error(f"Unexpected AWS error: {exc}")
         st.stop()
 
+
+# Cache the client across reruns
 bedrock_runtime = get_bedrock_client()
 logger.info("Bedrock client initialised ✔")
 
@@ -154,6 +156,7 @@ st.set_page_config(page_title="🪨🎙️ AskRock AI with Chat", page_icon="�
 st.title("🪨🎙️ AskRock AI: Bedrock Chat Assistant")
 st.caption("_Now with Chat History, Save, and Optional Image OCR!_")
 
+# Sidebar settings
 with st.sidebar:
     st.header("⚙️ Settings")
     max_tokens = st.slider("Max tokens:", 500, 30000, DEFAULT_MAX_TOKENS, step=500)
@@ -215,15 +218,15 @@ with col2:
                 except sr.RequestError as exc:
                     st.error(f"Speech recognition error: {exc}")
             except OSError as exc:
-                st.error("🎤 No microphone detected on this device/environment.")
+                st.error("🎤 No microphone detected on this device/environment. Please use text input instead.")
                 logger.error("Microphone init error: %s", exc)
     else:
-        st.info("🎤 Microphone not available in this environment. Please use text input or image upload.")
+        st.info("🎤 Microphone not available in this environment. Please use text input or upload an image.")
 
 # ─────────────────── 5. Chat handling & history ──────────────────
 
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history: List[Dict[str, str]] = []
+    st.session_state.chat_history: List[Dict[str, str]] = []  # type: ignore[assignment]
 
 if st.button("🚀 Get Answer"):
     if not user_query.strip() and not extracted_text.strip():
@@ -232,37 +235,43 @@ if st.button("🚀 Get Answer"):
         combined_prompt = build_prompt(user_query, topic, extracted_text)
         with st.expander("🔍 Prompt Details"):
             st.code(combined_prompt, language="markdown")
-
         payload = {
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": combined_prompt}],
         }
-
         try:
             with st.spinner("Thinking… ⏳"):
                 answer = attempt_model_invoke(payload, max_retries, retry_delay)
-
             if answer:
                 formatted = format_output(answer)
                 st.success("✅ **Answer:**")
                 st.markdown(f"### {formatted}")
-
                 st.session_state.chat_history.append({
                     "question": user_query or "[Image-only question]",
                     "answer": formatted,
                 })
-
                 if auto_speak:
                     speak_text(formatted)
             else:
-                st.warning("⚠️ Model did not return a valid response.")
+                st.error("⚠️ No response received after retries.")
         except Exception as exc:
-            logger.exception("Failed to invoke model")
-            st.error(f"❌ Error while generating answer: {exc}")
+            st.error(f"❌ Error: {exc}")
+            st.text(traceback.format_exc())
+
+# ───────────────────── 6. Display chat history ───────────────────
 
 if st.session_state.chat_history:
-    st.subheader("🗃️ Chat History")
-    for idx, entry in enumerate(reversed(st.session_state.chat_history), start=1):
-        with st.expander(f"💬 Q{idx}: {entry['question']}"):
-            st.markdown(f"**Answer:** {entry['answer']}")
+    st.markdown("---")
+    st.header("🗂️ Chat History")
+    for i, entry in enumerate(reversed(st.session_state.chat_history), 1):
+        st.markdown(f"**Q{i}:** {entry['question']}")
+        st.markdown(f"**A{i}:** {entry['answer']}")
+
+    if st.download_button(
+        label="💾 Download Chat History",
+        data="\n\n".join(f"Q: {e['question']}\nA: {e['answer']}" for e in st.session_state.chat_history),
+        file_name=f"askrock_chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+        mime="text/plain",
+    ):
+        st.success("✅ Chat history saved successfully!")
